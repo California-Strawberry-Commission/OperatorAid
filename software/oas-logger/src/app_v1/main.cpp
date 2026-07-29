@@ -527,7 +527,8 @@ bool getSavedSSID(char* out, size_t len) {
 // fires a reconnect if no WiFi connection
 void pollWiFiConnection() {
   if (WiFi.status() != WL_CONNECTED) {
-    EZLOG_INFO("[WiFi Poll] Connection lost. Reconnecting...");
+    EZLOG_INFO(
+        "[pollWiFiConnection] WiFi not connected. Attempting to reconnect...");
     WiFi.disconnect();
     WiFi.reconnect();  // Avoids possible WiFi.begin() reinitialization,
                        // resuses existing STA config in RAM
@@ -898,6 +899,12 @@ void startLoggerRun() {
   double m = 0;
   runHandle = logger.startRun(Encodable(m, "double"));
   lastLoggerStartRunMillis = millis();
+
+  // The SD flushing and WiFi reconnect attempts can end up permanently
+  // phase-locked - each WiFi reconnect attempt draws a power spike that can
+  // brown out the SD card. In order to avoid that, stagger the WiFi reconnect
+  // poll to half a cycle away.
+  lastWifiPollMillis = millis() - (WIFI_RECONNECT_INTERVAL_SECS * 1000) / 2;
 }
 
 void sleepCleanup() {
