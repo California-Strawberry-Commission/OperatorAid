@@ -27,6 +27,35 @@ void LogFile::taskFlusher(void* arg) {
   uint32_t lastSyncTime = millis();
   size_t bytesSinceLastSync = 0;
 
+  // Attempts to reopen the file in "r+" mode.
+  // IMPORTANT: we use "r+" (read/write) mode instead of "a" (append)
+  // here because any write in append mode will always go to end of file
+  // regardless of any seeks.
+  //
+  // A zero timeoutMs will keep retrying indefinitely until successful, or
+  // state is no longer LOGGING.
+  auto reopenWithRetry = [&](uint32_t timeoutMs) -> bool {
+    const uint32_t REOPEN_MAX_DELAY_MS = 2000;
+    uint32_t delayMs = 250;
+    uint32_t elapsedMs = 0;
+
+    while (self->state_ == LOGGING || elapsedMs < timeoutMs) {
+      self->file_ = self->fs_.open(self->filename_, "r+");
+      if (self->file_) {
+        self->file_.seek(0, SeekEnd);
+        return true;
+      }
+      DLFLIB_LOG_ERROR(
+          "[LogFile][taskFlusher] %s: Reopen failed, retrying in %u ms...",
+          self->filename_, delayMs);
+      vTaskDelay(pdMS_TO_TICKS(delayMs));
+      elapsedMs += delayMs;
+      delayMs = (delayMs * 2 < REOPEN_MAX_DELAY_MS) ? delayMs * 2
+                                                    : REOPEN_MAX_DELAY_MS;
+    }
+    return false;
+  };
+
   while (self->state_ == LOGGING) {
     size_t received = xStreamBufferReceive(self->stream_, buf, sizeof(buf),
                                            pdMS_TO_TICKS(1000));
@@ -47,9 +76,9 @@ void LogFile::taskFlusher(void* arg) {
         // Track the file end position for proper close
         self->fileEndPosition_ = totalBytesWritten;
 
-        // Force SD card sync after 60 seconds or 4KB written
-        // .flush() commits data the SD card
-        // only on .close() will directory entry be updated (e.g. 9MB to 10MB)
+        // Force SD card sync after 60 seconds or 4KB written.
+        // flush() commits data to the SD card.
+        // Only on close() will directory entry be updated (e.g. 9MB to 10MB)
         if ((bytesSinceLastSync >= SYNC_THRESHOLD_BYTES ||
              (millis() - lastSyncTime) >= SYNC_INTERVAL_MS) &&
             bytesSinceLastSync > 0) {
@@ -59,20 +88,14 @@ void LogFile::taskFlusher(void* arg) {
 
           self->file_.flush();
           self->file_.close();
-
-          // Reopen file in read/write mode to update the header
-          // IMPORTANT: we use "r+" (read/write) mode instead of "a" (append)
-          // here because any write in append mode will always go to end of file
-          // regardless of any seeks.
-          self->file_ = self->fs_.open(self->filename_, "r+");
-          if (!self->file_) {
-            DLFLIB_LOG_ERROR(
-                "[LogFile][taskFlusher] ERROR: Could not reopen file after "
-                "sync!");
-          } else {
-            self->file_.seek(0, SeekEnd);
+          if (reopenWithRetry(0)) {
             DLFLIB_LOG_INFO(
                 "[LogFile][taskFlusher] %s: SD sync complete, file reopened",
+                self->filename_);
+          } else {
+            DLFLIB_LOG_ERROR(
+                "[LogFile][taskFlusher] %s: FATAL: Failed to reopen file "
+                "before run ended. Data logged until recovery will be lost.",
                 self->filename_);
           }
 
@@ -118,9 +141,26 @@ void LogFile::taskFlusher(void* arg) {
     if (received > 0) {
       // Lock file mutex before writing
       if (xSemaphoreTake(self->fileMutex_, portMAX_DELAY) == pdTRUE) {
-        self->file_.write(buf, received);
-        totalBytesWritten += received;
-        self->fileEndPosition_ = totalBytesWritten;
+        // The file handle may be invalid if the file reopen attempt failed
+        // while exiting the LOGGING state, so try to reopen if needed here.
+        if (!self->file_) {
+          DLFLIB_LOG_ERROR(
+              "[LogFile][taskFlusher] %s: File handle invalid during final "
+              "drain, attempting recovery...",
+              self->filename_);
+          if (!reopenWithRetry(10000)) {
+            DLFLIB_LOG_ERROR(
+                "[LogFile][taskFlusher] %s: FATAL: Could not recover file "
+                "handle within timeout. Dropping %zu bytes.",
+                self->filename_, received);
+          }
+        }
+
+        if (self->file_) {
+          self->file_.write(buf, received);
+          totalBytesWritten += received;
+          self->fileEndPosition_ = totalBytesWritten;
+        }
         xSemaphoreGive(self->fileMutex_);
       }
     }
@@ -141,22 +181,23 @@ void LogFile::taskFlusher(void* arg) {
       self->file_.seek(0, SeekEnd);
       size_t actualFileSize = self->file_.position();
       DLFLIB_LOG_INFO(
-          "[LogFile][taskFlusher] Final SD sync complete. Actual file size: "
+          "[LogFile][taskFlusher] %s: Final SD sync complete. Actual file "
+          "size: "
           "%zu bytes",
-          actualFileSize);
+          self->filename_, actualFileSize);
       self->file_.close();
     } else {
       DLFLIB_LOG_ERROR(
-          "[LogFile][taskFlusher] ERROR: Could not reopen file for final sync "
-          "verification!");
+          "[LogFile][taskFlusher] %s: FATAL: Could not reopen file for final "
+          "sync verification!",
+          self->filename_);
     }
 
     self->fileEndPosition_ = totalBytesWritten;
     DLFLIB_LOG_INFO(
-        "[LogFile][taskFlusher] Final flush complete. Total bytes written: "
-        "%zu, file end "
-        "position: %zu",
-        totalBytesWritten, self->fileEndPosition_);
+        "[LogFile][taskFlusher] %s: Final flush complete. Total bytes written: "
+        "%zu, file end position: %zu",
+        self->filename_, totalBytesWritten, self->fileEndPosition_);
     xSemaphoreGive(self->fileMutex_);
   }
 
